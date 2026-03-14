@@ -7,10 +7,13 @@
 
 """
 
+import argparse
 import asyncio
 import csv
 import io
 import json
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 #import easyocr
@@ -18,6 +21,30 @@ import httpx
 #import numpy as np
 #from PIL import Image, ImageFilter, ImageOps
 import ddddocr
+
+
+# ---------------------------------------------------------------------------
+# Логгер (настраивается в точке входа через setup_logging)
+# ---------------------------------------------------------------------------
+
+log = logging.getLogger("rosreestr")
+
+
+def setup_logging(silent: bool, log_file: str | None) -> None:
+    log.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    if not silent:
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.DEBUG)
+        ch.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(ch)
+
+    if log_file:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
 
 
 # ---------------------------------------------------------------------------
@@ -116,35 +143,86 @@ async def fetch_object(
 async def fetch_object_with_captcha(
     client: httpx.AsyncClient,
     cad_number: str,
+    max_retries: int = MAX_RETRIES,
 ) -> dict | None:
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             image_bytes = await get_captcha_image(client)
             code = solve_captcha_local(image_bytes)
 
             if code is None:
-                print(f"  OCR не распознал капчу (попытка {attempt + 1}), повтор...")
+                log.warning("OCR не распознал капчу (попытка %d), повтор...", attempt + 1)
                 continue
 
-            print(f"  Капча: '{code}' (попытка {attempt + 1})")
+            log.debug("Капча: '%s' (попытка %d)", code, attempt + 1)
 
             if not await validate_captcha(client, code):
-                print(f"  Сервер отклонил капчу, повтор...")
+                log.warning("Сервер отклонил капчу, повтор...")
                 continue
 
             result = await fetch_object(client, cad_number, code)
             if result is not None:
                 return result
 
-            print(f"  Объект не найден: {cad_number}")
+            log.info("Объект не найден: %s", cad_number)
             return None
 
         except Exception as e:
-            print(f"  Ошибка (попытка {attempt + 1}): {e}")
+            log.error("Ошибка (попытка %d): %s", attempt + 1, e)
             await asyncio.sleep(REQUEST_DELAY)
 
-    print(f"  Провал после {MAX_RETRIES} попыток: {cad_number}")
+    log.error("Провал после %d попыток: %s", max_retries, cad_number)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Справочники кодов
+# ---------------------------------------------------------------------------
+
+STATUS_CODES = {
+    "0": "Ранее учтённый",
+    "1": "Актуально",
+    "5": "Снят с учёта",
+}
+
+OBJ_TYPE_CODES = {
+    "002001001000": "Земельный участок",
+    "002001002000": "Здание",
+    "002001003000": "Помещение",
+    "002001004000": "Сооружение",
+    "002001005000": "Объект незавершённого строительства",
+    "002001006000": "Машино-место",
+    "002003004000": "Единый недвижимый комплекс",
+}
+
+PURPOSE_CODES = {
+    "204001000000": "Нежилой",
+    "204002000000": "Жилой",
+    "204003000000": "Многоквартирный дом",
+    "205001000000": "Линейный",
+    "206001000000": "Нежилое",
+    "206002000000": "Жилое",
+}
+
+# ---------------------------------------------------------------------------
+# Утилита перевода Unix-timestamp (мс) в дату
+# ---------------------------------------------------------------------------
+
+def ts_to_date(ts_ms) -> str | None:
+    if not ts_ms:
+        return None
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%d.%m.%Y")
+
+
+# ---------------------------------------------------------------------------
+# Порядок полей в CSV — строго по README
+# ---------------------------------------------------------------------------
+
+CSV_FIELDS = [
+    "cad_number", "cad_quarter", "status", "obj_type", "area", "floor", "purpose",
+    "address_full", "address_region", "address_street", "address_house", "address_apartment",
+    "reg_date", "cad_cost", "cad_cost_date", "rights", "encumbrances", "raw_json",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -154,44 +232,55 @@ async def fetch_object_with_captcha(
 def flatten_object(obj: dict) -> dict:
     addr = obj.get("address") or {}
 
-    def ap(*keys):  # address part
-        return " ".join(addr.get(k) or "" for k in keys).strip() or None
+    rights_parts = []
+    for r in (obj.get("rights") or []):
+        right_type = r.get("rightTypeDesc") or r.get("type") or ""
+        right_num = r.get("rightNumber") or ""
+        right_date = ts_to_date(r.get("rightRegDate"))
+        part = r.get("part")
+        parts = [right_type]
+        if right_num:
+            parts.append(f"№ {right_num}")
+        if right_date:
+            parts.append(f"от {right_date}")
+        if part:
+            parts.append(f"доля {part}")
+        rights_parts.append(" ".join(p for p in parts if p))
+    rights_str = "; ".join(rights_parts)
 
-    full_address = ", ".join(p for p in [
-        addr.get("region"),
-        ap("cityType", "city"),
-        ap("streetType", "street"),
-        ap("houseType", "house"),
-        ap("buildingType", "building"),
-        ap("structureType", "structure"),
-        ap("apartmentType", "apartment"),
-    ] if p)
+    enc_parts = []
+    for e in (obj.get("encumbrances") or []):
+        enc_type = e.get("typeDesc") or e.get("type") or ""
+        enc_num = e.get("encumbranceNumber") or ""
+        enc_date = ts_to_date(e.get("startDate"))
+        parts = [enc_type]
+        if enc_num:
+            parts.append(f"№ {enc_num}")
+        if enc_date:
+            parts.append(f"от {enc_date}")
+        enc_parts.append(" ".join(p for p in parts if p))
+    enc_str = "; ".join(enc_parts)
 
-    rights_str = "; ".join(
-        f"{r.get('type', '')} ({r.get('date', '')} №{r.get('number', '')})"
-        for r in (obj.get("rights") or [])
-    )
-    enc_str = "; ".join(
-        f"{e.get('type', '')} №{e.get('number', '')}"
-        for e in (obj.get("encumbrances") or [])
-    )
+    obj_type_raw = obj.get("objType")
+    status_raw = obj.get("status")
+    purpose_raw = obj.get("purpose")
 
     return {
         "cad_number":        obj.get("cadNumber"),
         "cad_quarter":       obj.get("cadQuarter"),
-        "status":            obj.get("status"),
-        "obj_type":          obj.get("objType"),
+        "status":            STATUS_CODES.get(status_raw, status_raw),
+        "obj_type":          OBJ_TYPE_CODES.get(obj_type_raw, obj_type_raw),
         "area":              obj.get("area"),
-        "floor":             obj.get("floor"),
-        "purpose":           obj.get("purpose"),
-        "address_full":      full_address,
+        "floor":             obj.get("floor") or obj.get("levelFloor"),
+        "purpose":           PURPOSE_CODES.get(purpose_raw, purpose_raw),
+        "address_full":      addr.get("readableAddress"),
         "address_region":    addr.get("region"),
         "address_street":    addr.get("street"),
         "address_house":     addr.get("house"),
         "address_apartment": addr.get("apartment"),
-        "reg_date":          obj.get("regDate"),
+        "reg_date":          ts_to_date(obj.get("regDate")),
         "cad_cost":          obj.get("cadCost"),
-        "cad_cost_date":     obj.get("cadCostDate"),
+        "cad_cost_date":     ts_to_date(obj.get("cadCostDeterminationDate")),
         "rights":            rights_str,
         "encumbrances":      enc_str,
         "raw_json":          json.dumps(obj, ensure_ascii=False),
@@ -202,40 +291,36 @@ def flatten_object(obj: dict) -> dict:
 # Основной цикл
 # ---------------------------------------------------------------------------
 
-async def run(cad_numbers: list[str], output_csv: str = "results.csv"):
+async def run(cad_numbers: list[str], output_csv: str = "results.csv", max_retries: int = MAX_RETRIES):
     results = []
 
     async with httpx.AsyncClient(verify=False, timeout=30) as client:
         for i, cad_number in enumerate(cad_numbers):
-            print(f"[{i+1}/{len(cad_numbers)}] {cad_number}")
+            log.info("[%d/%d] %s", i + 1, len(cad_numbers), cad_number)
 
-            obj = await fetch_object_with_captcha(client, cad_number)
+            obj = await fetch_object_with_captcha(client, cad_number, max_retries=max_retries)
             if obj:
                 row = flatten_object(obj)
                 results.append(row)
-                print(f"  ✓ {row['address_full']} | {row['area']} м²")
+                log.info("  ✓ %s | %s м²", row["address_full"], row["area"])
             else:
                 results.append({"cad_number": cad_number, "error": "not_found"})
-                print(f"  ✗ не найден")
+                log.warning("  ✗ не найден: %s", cad_number)
 
             if i < len(cad_numbers) - 1:
                 await asyncio.sleep(REQUEST_DELAY)
 
     if not results:
-        print("Нет результатов")
+        log.warning("Нет результатов")
         return
 
-    all_keys: set[str] = set()
-    for r in results:
-        all_keys.update(r.keys())
-
     with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=sorted(all_keys), extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(results)
 
     ok = sum(1 for r in results if "error" not in r)
-    print(f"\nГотово: {ok}/{len(results)} объектов → {output_csv}")
+    log.info("Готово: %d/%d объектов → %s", ok, len(results), output_csv)
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +329,8 @@ async def run(cad_numbers: list[str], output_csv: str = "results.csv"):
 
 def cad_range(prefix: str, start: int, end: int) -> list[str]:
     """
-    cad_range("78:13:0007410", 1, 100)
-    → ["78:13:0007410:1", ..., "78:13:0007410:100"]
+    cad_range("50:20:0010203", 1, 100)
+    → ["50:20:0010203:1", ..., "50:20:0010203:100"]
     """
     return [f"{prefix}:{n}" for n in range(start, end + 1)]
 
@@ -255,26 +340,53 @@ def cad_range(prefix: str, start: int, end: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # пр. Славы 15, поиск по кадастровому номеру: curl 'https://nspd.gov.ru/api/geoportal/v2/search/geoportal?thematicSearchId=1&query=78%3A13%3A0741401%3A3018' -H 'referer: https://nspd.gov.ru/map?thematic=PKK&zoom=18&coordinate_x=3384781.855367066&coordinate_y=8361429.854958&theme_id=1&baseLayerId=235&is_copy_url=true' --insecure
-    # пр. Славы 15, список помещений: curl 'https://nspd.gov.ru/api/geoportal/v1/tab-group-data?tabClass=objectsList&objdocId=3222814600&registersId=36441' --insecure
+    parser = argparse.ArgumentParser(
+        description="Парсер справочной информации Росреестра по кадастровым номерам."
+    )
+    parser.add_argument(
+        "-i", "--input",
+        metavar="FILE",
+        help="Текстовый файл с кадастровыми номерами (по одному на строке). "
+             "Если не указан — используется список по умолчанию из скрипта.",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        metavar="FILE",
+        default="results.csv",
+        help="Имя выходного CSV-файла (по умолчанию: results.csv).",
+    )
+    parser.add_argument(
+        "-r", "--retries",
+        metavar="N",
+        type=int,
+        default=MAX_RETRIES,
+        help=f"Максимальное число попыток при ошибке капчи (по умолчанию: {MAX_RETRIES}).",
+    )
+    parser.add_argument(
+        "-s", "--silent",
+        action="store_true",
+        help="Тихий режим: ничего не выводить в консоль.",
+    )
+    parser.add_argument(
+        "-l", "--log",
+        metavar="FILE",
+        help="Файл для записи логов с таймстемпами (дополнительно к консоли, "
+             "или вместо неё при -s).",
+    )
+    args = parser.parse_args()
 
-    # Вариант 1: явный список кадастровых номеров
-    cad_numbers = [
-        "78:13:0741401:2",
-        "78:13:0741401:3018",
-#        "78:13:0741401:3922",
-    ]
-    
-    flats = ["78:13:0741401:3850","78:13:0741401:3851","78:13:0741401:3852","78:13:0741401:3853","78:13:0741401:3854","78:13:0741401:3855","78:13:0741401:3856","78:13:0741401:3857","78:13:0741401:3858","78:13:0741401:3859","78:13:0741401:3860","78:13:0741401:3861","78:13:0741401:3862","78:13:0741401:3863","78:13:0741401:3864","78:13:0741401:3865","78:13:0741401:3866","78:13:0741401:3867","78:13:0741401:3868","78:13:0741401:3869","78:13:0741401:3870","78:13:0741401:3871","78:13:0741401:3872","78:13:0741401:3873","78:13:0741401:3874","78:13:0741401:3875","78:13:0741401:3876","78:13:0741401:3877","78:13:0741401:3878","78:13:0741401:3879","78:13:0741401:3880","78:13:0741401:3881","78:13:0741401:3882","78:13:0741401:3883","78:13:0741401:3884","78:13:0741401:3885","78:13:0741401:3886","78:13:0741401:3887","78:13:0741401:3888","78:13:0741401:3889","78:13:0741401:3890","78:13:0741401:3891","78:13:0741401:3892","78:13:0741401:3893","78:13:0741401:3894","78:13:0741401:3895","78:13:0741401:3896","78:13:0741401:3897","78:13:0741401:3898","78:13:0741401:3899","78:13:0741401:3900","78:13:0741401:3901","78:13:0741401:3902","78:13:0741401:3903","78:13:0741401:3904","78:13:0741401:3905","78:13:0741401:3906","78:13:0741401:3907","78:13:0741401:3908","78:13:0741401:3909","78:13:0741401:3910","78:13:0741401:3911","78:13:0741401:3912","78:13:0741401:3913","78:13:0741401:3914","78:13:0741401:3915","78:13:0741401:3916","78:13:0741401:3917","78:13:0741401:3918","78:13:0741401:3919","78:13:0741401:3920","78:13:0741401:3921","78:13:0741401:3922","78:13:0741401:3923","78:13:0741401:3924","78:13:0741401:3925","78:13:0741401:3926","78:13:0741401:3927","78:13:0741401:3928","78:13:0741401:3929","78:13:0741401:3930","78:13:0741401:3931","78:13:0741401:3932","78:13:0741401:3933","78:13:0741401:3934","78:13:0741401:3935","78:13:0741401:3936","78:13:0741401:3937","78:13:0741401:3938","78:13:0741401:3939","78:13:0741401:3940","78:13:0741401:3941","78:13:0741401:3942","78:13:0741401:3943","78:13:0741401:3944","78:13:0741401:3945","78:13:0741401:3946","78:13:0741401:3947","78:13:0741401:3948","78:13:0741401:3949","78:13:0741401:3950","78:13:0741401:3951","78:13:0741401:3952","78:13:0741401:3953","78:13:0741401:3954","78:13:0741401:3955","78:13:0741401:3956","78:13:0741401:3957","78:13:0741401:3958","78:13:0741401:3959","78:13:0741401:3960","78:13:0741401:3961","78:13:0741401:3962","78:13:0741401:3963","78:13:0741401:3964","78:13:0741401:3965","78:13:0741401:3966","78:13:0741401:3967","78:13:0741401:3968","78:13:0741401:3969","78:13:0741401:3970","78:13:0741401:3971","78:13:0741401:3972","78:13:0741401:3973","78:13:0741401:3974","78:13:0741401:3975","78:13:0741401:3976","78:13:0741401:3977","78:13:0741401:3978","78:13:0741401:3979","78:13:0741401:3980","78:13:0741401:3981","78:13:0741401:3982","78:13:0741401:3983","78:13:0741401:3984","78:13:0741401:3985","78:13:0741401:3986","78:13:0741401:3987","78:13:0741401:3988","78:13:0741401:3989","78:13:0741401:3990","78:13:0741401:3991","78:13:0741401:3992","78:13:0741401:3993","78:13:0741401:3994","78:13:0741401:3995","78:13:0741401:3996","78:13:0741401:3997","78:13:0741401:3998","78:13:0741401:3999","78:13:0741401:4000","78:13:0741401:4001","78:13:0741401:4002","78:13:0741401:4003","78:13:0741401:4004","78:13:0741401:4005","78:13:0741401:4006","78:13:0741401:4007","78:13:0741401:4008","78:13:0741401:4009","78:13:0741401:4010","78:13:0741401:4011","78:13:0741401:4012","78:13:0741401:4013","78:13:0741401:4014","78:13:0741401:4015","78:13:0741401:4016","78:13:0741401:4017","78:13:0741401:4018","78:13:0741401:4019","78:13:0741401:4020","78:13:0741401:4021","78:13:0741401:4022","78:13:0741401:4023","78:13:0741401:4024","78:13:0741401:4025","78:13:0741401:4026","78:13:0741401:4027","78:13:0741401:4028","78:13:0741401:4029","78:13:0741401:4030","78:13:0741401:4031","78:13:0741401:4032","78:13:0741401:4033","78:13:0741401:4034","78:13:0741401:4035","78:13:0741401:4036","78:13:0741401:4037","78:13:0741401:4038","78:13:0741401:4039","78:13:0741401:4040","78:13:0741401:4041","78:13:0741401:4042","78:13:0741401:4043","78:13:0741401:4044","78:13:0741401:4045","78:13:0741401:4046","78:13:0741401:4047","78:13:0741401:4048"]
-    
-    cad_numbers += flats
-    
-    cad_numbers = ["78:13:0741401:4003", "78:13:0741401:3934"]
+    setup_logging(silent=args.silent, log_file=args.log)
 
-    # Вариант 2: диапазон (один дом, квартиры 1–100)
-    # cad_numbers = cad_range("78:13:0007410", 1, 100)
+    if args.input:
+        cad_numbers = Path(args.input).read_text(encoding="utf-8").strip().splitlines()
+        cad_numbers = [n.strip() for n in cad_numbers if n.strip()]
+    else:
+        # Список по умолчанию
+        cad_numbers = [
+            "50:20:0010203:1",
+            "50:20:0010203:2",
+            "50:20:0010203:100",
+            "50:20:0010203:101",
+        ]
 
-    # Вариант 3: из текстового файла (одна строка = один номер)
-    # cad_numbers = Path("input.txt").read_text().strip().splitlines()
-
-    asyncio.run(run(cad_numbers, output_csv="results.csv"))
+    asyncio.run(run(cad_numbers, output_csv=args.output, max_retries=args.retries))
